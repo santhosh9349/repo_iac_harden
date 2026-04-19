@@ -1111,4 +1111,4 @@ markdown-link-check README.md
 
 ---
 
-*Last updated: April 2026 | Based on GitHub Copilot Custom Agents public preview* 
+*Last updated: April 2026 | Based on GitHub Copilot Custom Agents public preview*  
