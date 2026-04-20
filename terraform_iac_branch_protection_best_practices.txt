@@ -1,0 +1,430 @@
+================================================================================
+GITHUB BRANCH PROTECTION BEST PRACTICES
+Terraform IaC Repository with AWS + GitHub Actions OIDC
+Source: GitHub Docs (about-protected-branches, managing-a-branch-protection-rule)
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 1: PULL REQUEST REVIEW REQUIREMENTS
+────────────────────────────────────────────────────────────────────────────────
+
+1.1  REQUIRE PR BEFORE MERGING                                    [CRITICAL]
+     Source: about-protected-branches
+     ─────────────────────────────────
+     No direct pushes to main. Every change — even hotfixes — must go through
+     a pull request. This is the foundational gate for all other review
+     requirements.
+
+     Why for IaC:
+     Direct pushes bypass all safety checks. A single unreviewed commit that
+     triggers terraform apply can destroy production resources without any
+     oversight or audit trail.
+
+
+1.2  REQUIRE 2 APPROVING REVIEWS                                  [CRITICAL]
+     Source: about-protected-branches
+     ─────────────────────────────────
+     Minimum 2 approvals from people with write permissions before a PR can
+     merge. One reviewer can miss something; two reviewers provide independent
+     verification of infrastructure changes.
+
+     Why for IaC:
+     One reviewer approving a security group change that opens 0.0.0.0/0 is a
+     single point of failure. Two independent reviewers catch what one misses,
+     especially for networking, IAM, and resource deletion changes.
+
+
+1.3  REQUIRE CODE OWNER REVIEW (CODEOWNERS FILE)                  [CRITICAL]
+     Source: about-protected-branches
+     ─────────────────────────────────
+     Create a CODEOWNERS file mapping Terraform modules to specific teams.
+     Changes to modules/networking/ require the networking team; changes to
+     modules/iam/ require the security team. Any one code owner approving is
+     sufficient to satisfy the requirement.
+
+     Example mappings:
+       - modules/networking/  →  networking team
+       - modules/iam/         →  security team
+       - modules/rds/         →  DBA team
+       - All *.tf files       →  devops leads
+
+     Why for IaC:
+     General reviewers can approve Terraform syntax without understanding the
+     security or compliance implications of a specific module. Module owners
+     have the domain expertise to catch real risks — an IAM change approved
+     only by someone unfamiliar with least-privilege principles is dangerous.
+
+
+1.4  DISMISS STALE REVIEWS ON NEW COMMITS                         [CRITICAL]
+     Source: about-protected-branches
+     ─────────────────────────────────
+     When any new commit is pushed to a PR, all existing approvals are
+     automatically invalidated. Reviewers must re-approve against the latest
+     code. This setting ALSO dismisses reviews when the merge base changes —
+     meaning if main advances after a review was submitted, the approval
+     becomes stale and must be renewed.
+
+     Why for IaC:
+     Prevents the "hijacking" attack where a malicious or incorrect commit is
+     added to a PR after approval. Especially critical for resource deletion
+     or IAM changes that were approved in a safer, earlier state. Also ensures
+     that if a subnet change merges to main while your RDS PR is open, the RDS
+     approval is invalidated and must be re-reviewed against the new network
+     baseline.
+
+
+1.5  REQUIRE APPROVAL FROM SOMEONE OTHER THAN LAST PUSHER         [HIGH]
+     Source: about-protected-branches
+     ─────────────────────────────────
+     The person who pushed the most recent commit cannot be the sole approver.
+     At least one approval must come from an independent reviewer who did not
+     make the latest changes. Prevents self-approval of last-minute additions.
+
+     Why for IaC:
+     An engineer cannot push a "small fix" to a Terraform plan and immediately
+     self-approve it. Another person must sign off on whatever was most
+     recently committed, regardless of how minor the change appears.
+
+
+1.6  RESTRICT WHO CAN DISMISS REVIEWS                             [HIGH]
+     Source: about-protected-branches
+     ─────────────────────────────────
+     Limit the ability to dismiss existing review approvals or change requests
+     to specific teams only (e.g., devops-leads, security-team). Prevents
+     admins or engineers from dismissing a blocking review to force-merge
+     their own code.
+
+     Why for IaC:
+     Without this restriction, any repository admin could dismiss a "Changes
+     Requested" review from the security team and force-merge a vulnerable IAM
+     policy or open security group. This control locks that dismissal power to
+     a small set of trusted leads who are accountable for the decision.
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 2: REQUIRED STATUS CHECKS (CI GATES)
+────────────────────────────────────────────────────────────────────────────────
+
+2.1  ENABLE STRICT STATUS CHECKS (REQUIRE UP TO DATE)             [CRITICAL]
+     Source: about-protected-branches
+     ─────────────────────────────────
+     Require the PR branch to be fully up to date with main before merging.
+     If main advances while a PR is open, the author must rebase or merge
+     before the PR can be merged. Status checks always run against the latest
+     integration point, not a stale snapshot.
+
+     Why for IaC:
+     If someone merges a subnet change to main while your RDS PR is open, your
+     terraform plan was generated against the old network state. Strict mode
+     forces a replan against the new baseline before merge, catching
+     integration failures (conflicts, state drift, incompatible resource
+     dependencies) before they reach production.
+
+
+2.2  LOCK STATUS CHECKS TO SPECIFIC APPS (GITHUB-ACTIONS)        [CRITICAL]
+     Source: about-protected-branches
+     ─────────────────────────────────
+     For each required status check, set the required source to github-actions
+     (not "any source"). This ensures only GitHub Actions workflows can mark a
+     check as passed — not any person with write access who could call the
+     GitHub status API manually to fake a passing result.
+
+     Recommended required checks for a Terraform repo:
+       - terraform-validate      (syntax and provider validation)
+       - terraform-plan          (execution plan with no errors)
+       - terraform-fmt-check     (consistent formatting enforced)
+       - tfsec-security-scan     (static security analysis)
+       - checkov-policy-check    (compliance policy enforcement)
+       - infracost-estimate      (cost impact visibility)
+
+     Why for IaC:
+     A compromised developer account can manually call the GitHub Statuses API
+     and mark "terraform-plan: success" without actually running the plan.
+     Locking each check to the github-actions app means only the automated
+     workflow can set that status — a human account cannot fake it.
+
+
+2.3  USE UNIQUE JOB NAMES ACROSS ALL WORKFLOWS                    [HIGH]
+     Source: about-protected-branches (explicit tip in docs)
+     ─────────────────────────────────
+     The GitHub docs explicitly warn: if two workflows share the same job name
+     (e.g., both have a job called "validate"), the status check results become
+     ambiguous and can permanently block PRs from merging. Every job name
+     across all workflow files must be globally unique within the repository.
+
+     Example of correctly named jobs:
+       - validate.yml     →  job name: terraform-validate
+       - plan.yml         →  job name: terraform-plan
+       - security.yml     →  job name: tfsec-scan
+
+     Why for IaC:
+     A Terraform repo typically has multiple workflow files (plan, apply,
+     validate, security). Duplicate job names mean GitHub cannot distinguish
+     which workflow produced which status, creating an unresolvable merge
+     block.
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 3: CONVERSATION RESOLUTION AND COMMIT HISTORY
+────────────────────────────────────────────────────────────────────────────────
+
+3.1  REQUIRE CONVERSATION RESOLUTION BEFORE MERGING               [HIGH]
+     Source: about-protected-branches
+     ─────────────────────────────────
+     Every review comment thread must be explicitly marked "resolved" before
+     the PR can merge. Ensures no open questions, unaddressed concerns, or
+     security flags are silently ignored at merge time.
+
+     Why for IaC:
+     A reviewer comments "Is this S3 bucket public? Please confirm." Without
+     this setting, that comment can be left dangling and the PR merges anyway.
+     This forces the author to explicitly resolve every concern — either by
+     making a change or by providing a clear justification that the reviewer
+     acknowledges.
+
+
+3.2  REQUIRE LINEAR HISTORY (SQUASH OR REBASE ONLY)               [HIGH]
+     Source: about-protected-branches
+     ─────────────────────────────────
+     Prevent merge commits on main. All PRs must use squash merge or rebase
+     merge. Creates a clean, bisectable commit history where every commit on
+     main represents one coherent, reviewed infrastructure change.
+
+     Repository merge settings to enable:
+       - Allow squash merging: yes
+       - Allow rebase merging: yes
+       - Allow merge commits: no
+
+     Why for IaC:
+     Merge commits make git bisect and git blame confusing when debugging
+     "which Terraform change caused this AWS cost spike." A linear history
+     makes audit and rollback straightforward. Each commit on main maps
+     directly to one approved PR and one infrastructure change.
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 4: SIGNED COMMITS AND DEPLOYMENT GATES
+────────────────────────────────────────────────────────────────────────────────
+
+4.1  REQUIRE SIGNED COMMITS                                        [HIGH]
+     Source: about-protected-branches
+     ─────────────────────────────────
+     Every commit pushed to main must be GPG or SSH signed and verified by
+     GitHub. Commits from unsigned or unverifiable identities are rejected.
+     Note: squash-and-merge creates a new signed commit automatically, so this
+     does not block the squash workflow.
+
+     Each developer must configure:
+       - GPG signing:  git config --global commit.gpgsign true
+       - Or SSH signing keys registered in their GitHub account settings
+
+     Why for IaC:
+     Provides cryptographic proof that a commit came from a known, verified
+     identity. If an attacker gains repository write access via stolen
+     credentials, they cannot push commits that appear to be from a legitimate
+     engineer — unsigned commits are rejected at the branch level.
+
+
+4.2  REQUIRE DEPLOYMENTS TO SUCCEED BEFORE MERGING                [MEDIUM]
+     Source: about-protected-branches
+     ─────────────────────────────────
+     Require that Terraform changes are successfully applied to a staging or
+     non-production environment before the PR can merge to main. The deployment
+     environment must report "success" as a GitHub deployment status check.
+
+     Why for IaC:
+     terraform plan can look clean but terraform apply can still fail due to
+     race conditions, state drift, provider bugs, or IAM permission issues.
+     Requiring a successful apply to staging proves the code actually works
+     end-to-end before it is promoted to target production. This is the
+     difference between "the plan looks fine" and "we actually applied it
+     successfully."
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 5: PUSH RESTRICTIONS AND ADMIN CONTROLS
+────────────────────────────────────────────────────────────────────────────────
+
+5.1  DO NOT ALLOW BYPASSING PROTECTION RULES (ENFORCE ON ADMINS)  [CRITICAL]
+     Source: about-protected-branches
+     ─────────────────────────────────
+     By default, repository admins can bypass all branch protection rules.
+     Enable "Do not allow bypassing the above settings" so that even admins
+     must go through the same PR, review, and CI gates as everyone else.
+
+     Why for IaC:
+     The most dangerous infrastructure changes often come from admins bypassing
+     rules "just this once" for an urgent fix. A misconfigured IAM policy or
+     an accidentally deleted S3 bucket does not care that it was a repo admin
+     who pushed it. Emergencies are not a reason to skip review — they are
+     exactly when review is most important.
+
+
+5.2  RESTRICT WHO CAN PUSH TO MAIN                                [CRITICAL]
+     Source: about-protected-branches
+     ─────────────────────────────────
+     Limit push access (the ability to merge PRs into main) to specific teams
+     and apps only. Recommended:
+       - devops-leads team: human escalation path for approvals
+       - github-actions bot: automated merges after all gates pass
+       - Individual engineers: should NOT be in this list
+
+     Why for IaC:
+     With OIDC-based deployments, only the GitHub Actions bot should actually
+     merge to main (via auto-merge after all gates pass). No individual
+     engineer should be able to approve AND merge their own Terraform changes.
+     Separation of the "write code" and "merge to production" actions is a
+     fundamental control.
+
+
+5.3  DISABLE FORCE PUSHES                                          [CRITICAL]
+     Source: about-protected-branches
+     ─────────────────────────────────
+     Force pushes are blocked by default on protected branches — ensure this
+     remains disabled and is never enabled. Force pushing rewrites commit
+     history, can remove previously approved commits, and destroys the audit
+     trail of who reviewed and approved each infrastructure change.
+
+     Why for IaC:
+     Force pushing to main could erase the evidence that a destructive
+     Terraform change was reviewed and approved — this is critical for
+     compliance audits (SOC2, PCI, ISO27001). This setting must never be
+     enabled on a production infrastructure repository.
+
+
+5.4  DISABLE BRANCH DELETION                                       [HIGH]
+     Source: about-protected-branches
+     ─────────────────────────────────
+     Prevent the main branch from being deleted. This is the default for
+     protected branches but should be explicitly confirmed and never changed.
+     Combined with force push prevention, this preserves the complete history
+     of all infrastructure changes.
+
+     Why for IaC:
+     Deleting main would destroy the entire Terraform change history and all
+     associated audit records. Even an accidental "git push --delete origin
+     main" from a developer's terminal could be catastrophic and difficult
+     to recover from.
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 6: OIDC AND GITHUB ACTIONS PIPELINE GATES
+────────────────────────────────────────────────────────────────────────────────
+
+6.1  SEPARATE PLAN (PR) AND APPLY (POST-MERGE) WORKFLOWS          [CRITICAL]
+     Source: about-protected-branches (status checks + deployment sections)
+     ─────────────────────────────────
+     The PR workflow (triggered on pull_request events) should run
+     terraform plan using a read-only OIDC role and post the plan output as
+     a PR comment and a required status check. The apply workflow (triggered
+     on push to main) should use a separate write-access OIDC role and run
+     terraform apply.
+
+     AWS OIDC trust conditions should be scoped to:
+       - Plan role:   repo:org/repo:pull_request  (read-only AWS access)
+       - Apply role:  repo:org/repo:ref:refs/heads/main  (write AWS access)
+
+     Why:
+     This means even if a PR workflow is manipulated, it physically cannot
+     modify AWS resources — the OIDC role trust policy denies write actions
+     for pull_request trigger events. The plan and apply roles are
+     cryptographically separated at the AWS IAM level, not just at the
+     workflow level.
+
+
+6.2  USE GITHUB ENVIRONMENT PROTECTION RULES FOR APPLY            [CRITICAL]
+     Source: about-protected-branches (required deployments section)
+     ─────────────────────────────────
+     Configure GitHub Environments (e.g., "production") with required
+     reviewers and deployment branch restrictions. The terraform apply job
+     must target the production environment, which requires a human approval
+     before the apply step executes — this is separate from and in addition
+     to the PR review.
+
+     Recommended environment settings:
+       - Required reviewers:      devops-leads team
+       - Deployment branches:     main only (no other branches can deploy)
+       - Wait timer:              5 minutes (window to abort if needed)
+
+     Why:
+     This creates a two-stage gate. Stage 1: PR review approves the Terraform
+     code and plan. Stage 2: Environment protection requires an explicit human
+     sign-off before apply actually runs against AWS. A merged PR does not
+     automatically trigger infrastructure changes — a person must consciously
+     approve the deployment.
+
+
+6.3  PIN GITHUB ACTIONS WORKFLOW VERSIONS TO COMMIT SHAS          [HIGH]
+     Source: about-protected-branches (status check source section)
+     ─────────────────────────────────
+     Use pinned commit SHAs for all third-party GitHub Actions, not floating
+     version tags. A floating tag like @v3 can be silently updated by the
+     action's author to inject malicious code into your OIDC-authenticated
+     workflow without any change visible in your repository.
+
+     Example:
+       Bad:   uses: hashicorp/setup-terraform@v3
+       Good:  uses: hashicorp/setup-terraform@651471c36a6092792c552e8b1bef71e592b462d8
+
+     Why for OIDC:
+     A supply-chain attack on a floating action tag could exfiltrate your OIDC
+     token mid-workflow and use it to make arbitrary AWS API calls with your
+     plan or apply role's permissions. Pinning to a SHA means the code you
+     reviewed is immutably the code that runs — no silent updates possible.
+
+
+────────────────────────────────────────────────────────────────────────────────
+SUMMARY: PRIORITY MATRIX
+────────────────────────────────────────────────────────────────────────────────
+
+CRITICAL — implement before going live:
+  1.1  Require PR before merging
+  1.2  Require 2 approving reviews
+  1.3  Require code owner review (CODEOWNERS)
+  1.4  Dismiss stale reviews on new commits
+  2.1  Strict status checks (require up to date branch)
+  2.2  Lock status checks to github-actions app only
+  5.1  Enforce protection rules on admins (no bypass)
+  5.2  Restrict who can push to main
+  5.3  Disable force pushes
+  6.1  Separate plan and apply OIDC roles
+  6.2  GitHub Environment protection for apply workflow
+
+HIGH — implement as soon as possible:
+  1.5  Require approval from someone other than last pusher
+  1.6  Restrict who can dismiss pull request reviews
+  2.3  Use unique job names across all workflows
+  3.1  Require conversation resolution before merging
+  3.2  Require linear history (squash or rebase only)
+  4.1  Require signed commits
+  5.4  Disable branch deletion
+  6.3  Pin GitHub Actions to commit SHAs
+
+MEDIUM — implement for mature / compliance-driven setups:
+  4.2  Require deployments to succeed before merging (staging gate)
+
+
+────────────────────────────────────────────────────────────────────────────────
+ADDITIONAL NOTES
+────────────────────────────────────────────────────────────────────────────────
+
+- The GitHub docs note that only one branch protection rule can be active per
+  branch at a time. If multiple rules match the same branch, the most specific
+  rule (exact branch name) takes priority over wildcard patterns.
+
+- For repositories belonging to an organization, bypass lists (actors who can
+  skip branch protections) can be configured, but should be empty for
+  production IaC repositories.
+
+- The docs recommend considering GitHub Rulesets as a more scalable alternative
+  to branch protection rules, especially when the same set of rules needs to
+  apply across many repositories in an organization.
+
+- Status check names must exactly match the job names in your GitHub Actions
+  workflow YAML files. A renamed job will cause the required status check to
+  never be satisfied.
+
+================================================================================
+EOF
+================================================================================

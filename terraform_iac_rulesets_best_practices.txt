@@ -1,0 +1,740 @@
+================================================================================
+GITHUB RULESETS BEST PRACTICES
+Terraform IaC Repository with AWS + GitHub Actions OIDC
+Source: GitHub Docs (about-rulesets, available-rules-for-rulesets)
+================================================================================
+
+WHAT ARE RULESETS?
+──────────────────
+A ruleset is a named list of rules that applies to a repository, or to multiple
+repositories in an organisation (GitHub Team and Enterprise plans). Unlike
+branch protection rules, multiple rulesets can be active on the same branch
+simultaneously — all rules aggregate and the most restrictive version of each
+rule wins. Rulesets also layer on top of any existing branch protection rules.
+
+You can have up to 75 rulesets per repository, and 75 organisation-wide
+rulesets. Anyone with read access to the repository can view active rulesets —
+no admin access required.
+
+KEY DIFFERENCES FROM BRANCH PROTECTION RULES (SUMMARY)
+────────────────────────────────────────────────────────
+  - Multiple rulesets can apply to one branch at once (no priority conflict)
+  - Enforcement statuses: Active or Disabled (toggle without deleting)
+  - Visible to all read-access users, not just admins
+  - Fine-grained bypass per role, team, or specific GitHub App
+  - Can target branches AND tags with the same rule type
+  - Push rulesets apply to the entire fork network
+  - Can restrict pushes by file path, extension, path length, and file size
+  - Org-wide rulesets can target many repos from one definition
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 1: RULESET STRUCTURE AND ENFORCEMENT
+────────────────────────────────────────────────────────────────────────────────
+
+1.1  USE ENFORCEMENT STATUSES DELIBERATELY                        [CRITICAL]
+     Source: about-rulesets
+     ─────────────────────────────────
+     Every ruleset has an enforcement status that controls whether it is
+     active. Available statuses:
+
+       Active   — the ruleset is fully enforced immediately upon creation.
+       Disabled — the ruleset exists but is not enforced. Configuration is
+                  preserved and can be re-enabled at any time.
+
+     Best practice for a Terraform repo:
+     Create new rulesets in Disabled status first. Wire up the corresponding
+     GitHub Actions workflow, validate it on a test PR, confirm the status
+     check name matches exactly, then flip to Active. This prevents
+     accidentally blocking all PRs during a partial rollout of a new check.
+
+     Why for IaC:
+     Adding a new required status check (e.g., checkov-policy-check) to an
+     Active ruleset before the workflow is ready will immediately block every
+     open PR in the repository. Using Disabled status lets you prepare the
+     full pipeline before enforcement begins.
+
+
+1.2  CONFIGURE FINE-GRAINED BYPASS PERMISSIONS                    [CRITICAL]
+     Source: about-rulesets, available-rules-for-rulesets
+     ─────────────────────────────────
+     Rulesets allow bypass permissions to be granted to specific entities:
+       - Specific roles (e.g., repository administrator)
+       - Named teams (e.g., devops-leads)
+       - Specific GitHub Apps (e.g., the github-actions bot)
+
+     For a Terraform IaC repo, the recommended bypass model is:
+       - github-actions app: bypass push restrictions so the bot can
+         merge approved PRs after all gates pass (automated merge path)
+       - devops-leads team: bypass for emergency human intervention only
+       - No individual engineers in the bypass list
+
+     For push rulesets specifically: bypass permissions apply to the entire
+     fork network. The only users who can bypass a push ruleset for any
+     repository in the fork network are those with bypass permissions in
+     the root repository.
+
+     Why for IaC:
+     Branch protection rules have coarse bypass — you either give admins
+     a bypass or you do not. Rulesets let you grant bypass to the
+     github-actions app without also giving every repo admin a bypass.
+     This means human engineers must go through the review process even in
+     an emergency, while the automated pipeline can still function.
+
+
+1.3  UNDERSTAND RULE LAYERING — MOST RESTRICTIVE ALWAYS WINS      [HIGH]
+     Source: about-rulesets
+     ─────────────────────────────────
+     When multiple rulesets (and any existing branch protection rules) target
+     the same branch, all rules from all sources are aggregated. Where the
+     same rule is defined differently across sources, the most restrictive
+     version applies.
+
+     Practical example for a Terraform repo:
+       Branch protection rule:  requires 2 PR reviews, linear history
+       Ruleset A (devops):      requires signed commits, 3 PR reviews
+       Ruleset B (security):    requires code scanning results
+
+       Result on main branch:   3 reviews (most restrictive count),
+                                 linear history, signed commits, AND
+                                 code scanning results — all four apply.
+
+     Why for IaC:
+     This means you do not have to consolidate everything into one ruleset.
+     A security team can own a security ruleset, a devops team can own a
+     deployment ruleset, and both apply simultaneously without conflict.
+     There is no risk of one ruleset silently overriding another.
+
+
+1.4  TARGET BRANCHES AND TAGS WITH FNMATCH PATTERNS               [HIGH]
+     Source: about-rulesets, available-rules-for-rulesets
+     ─────────────────────────────────
+     Ruleset branch/tag targeting uses fnmatch syntax, the same as branch
+     protection rules. Recommended patterns for a Terraform repo:
+
+       main                — exact match, protects the default branch
+       release/**/*        — protects all release branches
+       v*                  — protects all version tags (e.g., v1.0.0)
+       hotfix/**/*         — protects all hotfix branches
+
+     Important fnmatch behaviour:
+       - The * wildcard does not match directory separators (/)
+       - Use **/* to match across multiple path segments
+       - More specific patterns (exact branch names) take priority over
+         wildcard patterns when determining which rule to display, but
+         all matching rulesets still aggregate and apply simultaneously
+
+     Why for IaC:
+     Protecting tags is particularly important in a Terraform repo because
+     tags are often used to pin module versions. A tampered tag pointing to
+     a different commit would silently change what code gets deployed across
+     all consumers of that module.
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 2: BRANCH AND TAG RULESET — REVIEW AND MERGE RULES
+────────────────────────────────────────────────────────────────────────────────
+
+2.1  RESTRICT CREATIONS                                            [HIGH]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     Only users with bypass permissions can create branches or tags whose
+     name matches the ruleset pattern. For a pattern like release/**/* or
+     v*, this prevents engineers from creating release branches or version
+     tags directly — creation must go through the bypass-permitted path
+     (typically the CI/CD pipeline or a designated release manager).
+
+     Why for IaC:
+     Prevents unauthorised creation of release branches that could trigger
+     production deployments. In a Terraform repo, creating a branch named
+     release/prod could inadvertently match automation that triggers a
+     terraform apply against production.
+
+
+2.2  RESTRICT UPDATES                                              [CRITICAL]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     Only users with bypass permissions can push to branches or tags whose
+     name matches the pattern. For main, this means no direct pushes from
+     any engineer — all changes must arrive via a merged, reviewed PR.
+
+     Why for IaC:
+     Direct pushes to main bypass all CI status checks, all PR reviews,
+     and all code owner approvals. A single direct push can apply
+     unreviewed Terraform code to production AWS infrastructure with no
+     audit trail of who approved it.
+
+
+2.3  RESTRICT DELETIONS                                            [CRITICAL]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     Only users with bypass permissions can delete branches or tags matching
+     the pattern. This rule is enabled by default in new rulesets. Confirm
+     it is active for main, all release branches, and all version tags.
+
+     Why for IaC:
+     Deleting main destroys the entire Terraform change history and all
+     associated audit records. Deleting a version tag breaks all Terraform
+     module references that pin to that tag across dependent repositories.
+
+
+2.4  REQUIRE PULL REQUEST BEFORE MERGING                          [CRITICAL]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     All changes to the target branch must be associated with a pull request.
+     The PR must be opened, but does not have to be approved unless you also
+     configure required approvals (see 2.5 and 2.6 below).
+
+     Additional PR settings available within this rule:
+
+       Require approvals (count):
+         Set the minimum number of approving reviews required. Recommended
+         value for a production Terraform repo: 2. One reviewer can miss a
+         subtle security issue; two provide independent verification.
+
+       Dismiss stale reviews when new commits are pushed:
+         When a new commit is pushed to the PR branch, all existing approvals
+         are invalidated. Reviewers must re-approve the updated code. This
+         setting ALSO triggers when the merge base changes — i.e., when main
+         advances after a review was submitted, the approval is dismissed and
+         must be renewed. This is the primary defence against the "hijacking"
+         attack where a malicious commit is added after approval.
+
+       Require review from code owners:
+         Any PR that modifies files with a designated code owner must be
+         approved by that code owner before merging. Backed by a CODEOWNERS
+         file in the repository root. Any one of the file's code owners
+         approving is sufficient to satisfy the requirement.
+
+       Require approval from someone other than the last pusher:
+         The person who pushed the most recent commit cannot be the sole
+         approver. At least one independent reviewer must sign off on the
+         latest changes. Prevents self-approval of last-minute additions.
+
+       Require resolution of all conversations before merging:
+         Every review comment thread must be explicitly marked resolved before
+         the PR can merge. Ensures no open security concerns or unanswered
+         questions are silently ignored at merge time.
+
+       Require a specific merge type:
+         Enforce that all PRs use squash merge or rebase merge — no merge
+         commits. Combined with linear history (see 2.7), this keeps main
+         clean and bisectable. If the repository has disabled a merge method
+         and the ruleset requires that method, the merge is blocked.
+
+     Why for IaC:
+     All of the above settings working together mean: every change to main
+     was opened as a PR, seen by at least two people (including any module
+     code owner), cannot have been self-approved after the last commit, has
+     no unresolved review comments, and arrived as a clean squash commit.
+     This is the baseline audit trail required for infrastructure changes.
+
+
+2.5  CONFIGURE REQUIRED REVIEWERS PER FILE PATTERN                [HIGH]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     Within the pull request rule, rulesets support a "required reviewers"
+     sub-rule that maps file patterns to specific teams with a required
+     approval count per team. Up to 15 different teams can be specified,
+     each with a count from 0 (visibility only) to 10 approvals.
+
+     File pattern format follows the same syntax as .gitignore files:
+       - Patterns are matched in order
+       - A pattern starting with ! is a negation (excludes previously
+         matched paths from requiring approvals)
+       - This is more flexible than CODEOWNERS for complex scenarios
+
+     Recommended mappings for a Terraform repo:
+       modules/iam/**         →  security-team, 1 approval required
+       modules/networking/**  →  networking-team, 1 approval required
+       modules/rds/**         →  dba-team, 1 approval required
+       .github/workflows/**   →  devops-leads, 1 approval required
+       *.tf (all root TF)     →  devops-leads, 1 approval required
+
+     Why for IaC:
+     This is more powerful than CODEOWNERS alone because you can require
+     approvals from multiple teams on the same file independently, set
+     different approval counts per team, and use negation patterns to
+     create exceptions. A change to modules/iam/ might require 1 approval
+     from the security team AND 1 from devops-leads simultaneously.
+
+
+2.6  REQUIRE STATUS CHECKS — STRICT MODE                          [CRITICAL]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     Required status checks ensure all CI tests pass before a PR can merge.
+     Use strict mode (require branch to be up to date before merging).
+
+     In strict mode, the PR branch must be fully up to date with the target
+     branch before merging. If main advances while a PR is open, the author
+     must rebase or merge-in the new main commits, then the status checks
+     rerun against the updated integration. This catches conflicts before
+     they reach production rather than after.
+
+     Required status check names for a Terraform repo:
+       terraform-validate      — syntax and provider schema validation
+       terraform-plan          — execution plan with no errors
+       terraform-fmt-check     — consistent formatting enforcement
+       tfsec-security-scan     — static security analysis
+       checkov-policy-check    — compliance policy enforcement
+       infracost-estimate      — cost impact visibility
+
+     Source locking:
+     For each required status check, set the required source to a specific
+     GitHub App (e.g., github-actions). The app must be installed in the
+     repository with the statuses:write permission, must have recently
+     submitted a check run, and must be associated with a pre-existing
+     required status check in the ruleset. If the status is set by any
+     other person or integration, merging is blocked.
+
+     Why source locking matters for IaC:
+     A compromised developer account can call the GitHub Statuses API
+     manually and mark terraform-plan:success without actually running the
+     plan. Locking each check to the github-actions app prevents this —
+     only the automated workflow can set that status.
+
+     Why strict mode matters for IaC:
+     If someone merges a subnet change to main while your RDS PR is open,
+     your terraform plan was generated against the old network state. Strict
+     mode forces a replan against the new baseline before merge, catching
+     integration failures (resource conflicts, state drift, incompatible
+     dependencies) before they reach production.
+
+
+2.7  REQUIRE LINEAR HISTORY                                        [HIGH]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     Prevent merge commits on main. All PRs must use squash merge or rebase
+     merge. Every commit on main represents one coherent, reviewed
+     infrastructure change that can be individually reverted or bisected.
+
+     Before enabling, confirm the repository allows squash merging or rebase
+     merging in the repository merge settings.
+
+     Why for IaC:
+     Merge commits make git bisect and git blame confusing when debugging
+     which Terraform change caused an unexpected AWS resource modification.
+     A linear history means every commit maps directly to one approved PR
+     and one infrastructure change, making audit and rollback straightforward.
+
+
+2.8  REQUIRE SIGNED COMMITS                                        [HIGH]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     Only GPG or SSH signed and verified commits can be pushed to the
+     target branch. Commits from unsigned identities are rejected.
+
+     Behaviour difference from branch protection rules:
+     With rulesets, when creating a branch, only commits that are not
+     accessible from other branches are checked for signatures. With branch
+     protection rules, signed commit verification is not performed at branch
+     creation unless you also restrict pushes that create matching branches.
+     When updating a branch, both systems check all commits in the range.
+
+     Practical setup:
+       - Each developer must configure GPG signing or SSH signing keys
+         registered in their GitHub account settings
+       - Squash-and-merge creates a new signed commit automatically,
+         so this does not interfere with the squash merge workflow
+       - Vigilant mode users: commits identified as "Partially verified"
+         are permitted on branches requiring signed commits
+
+     Why for IaC:
+     Cryptographic proof of authorship on every commit to main. If an
+     attacker gains repository write access via stolen credentials, unsigned
+     commits are rejected at the branch boundary regardless of how they
+     were created.
+
+
+2.9  REQUIRE DEPLOYMENTS TO SUCCEED BEFORE MERGING                [MEDIUM]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     Require that changes are successfully deployed to specific environments
+     before the branch can be merged. Configure the ruleset to require a
+     successful deployment to staging before a PR can merge to main.
+
+     This works in conjunction with GitHub Environments. The deployment
+     environment must report a "success" status before the merge is allowed.
+
+     Why for IaC:
+     terraform plan can look clean but terraform apply can still fail due
+     to race conditions, state drift, provider bugs, or IAM permission gaps.
+     Requiring a successful apply to a staging environment proves the code
+     works end-to-end before it is promoted to target production. This is
+     the difference between "the plan looks correct" and "we actually
+     applied it successfully against real AWS infrastructure."
+
+
+2.10 BLOCK FORCE PUSHES                                            [CRITICAL]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     This rule is enabled by default in new rulesets. Confirm it is active
+     and never disabled. Force pushing rewrites commit history, can remove
+     previously reviewed and approved commits, and destroys the audit trail
+     of who approved which infrastructure change.
+
+     Enabling force pushes does not override other rules. For example, if
+     a branch requires linear history, force pushing merge commits to that
+     branch is still blocked even if force push is technically permitted.
+
+     Why for IaC:
+     Force pushing to main could erase the evidence that a destructive
+     Terraform change was reviewed and approved. This is critical for
+     compliance audits such as SOC2, PCI DSS, and ISO27001 where you must
+     demonstrate that all production infrastructure changes were authorised.
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 3: PUSH RULESETS — UNIQUE TO RULESETS, NO EQUIVALENT IN BRANCH PROTECTION
+────────────────────────────────────────────────────────────────────────────────
+
+Push rulesets apply to every push to the repository regardless of branch
+targeting. They also apply to the ENTIRE fork network — if you fork the
+repository, the same push rulesets apply to the fork. Bypass permissions for
+push rulesets are inherited from the root repository only.
+
+3.1  RESTRICT FILE PATHS                                           [CRITICAL]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     Prevent commits that include changes to specified file paths from being
+     pushed. Limit is 200 entries, each up to 200 characters. Uses fnmatch
+     syntax.
+
+     Recommended file path restrictions for a Terraform IaC repo:
+
+       .github/workflows/**     — protect CI/CD pipeline definitions from
+                                  unauthorised modification (bypass for
+                                  devops-leads team only)
+
+       backend.tf               — protect state backend configuration from
+                                  being changed without explicit sign-off
+
+       providers.tf             — protect provider version pins to prevent
+                                  silent provider upgrades
+
+     Why for IaC:
+     Protecting .github/workflows/ via a push ruleset is more reliable than
+     CODEOWNERS alone because it applies at the git push level, before the
+     PR is even created. An engineer cannot sneak a workflow change past
+     review by combining it with a large, complex PR. The push is blocked
+     entirely until a bypass-permitted team member approves the path.
+
+
+3.2  RESTRICT FILE EXTENSIONS                                      [CRITICAL]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     Prevent commits that include files with specified extensions from being
+     pushed. Limit is 200 entries, each up to 200 characters.
+
+     Recommended extension restrictions for a Terraform IaC repo:
+
+       .tfstate         — Terraform state files must NEVER be committed to
+                          version control. They contain plaintext resource IDs,
+                          ARNs, and potentially sensitive output values.
+
+       .tfstate.backup  — Backup state files carry the same risk as .tfstate
+
+       .pem             — Private keys and certificates
+
+       .key             — Private key files
+
+       .pfx             — Certificate and private key bundles
+
+       .p12             — PKCS12 certificate bundles
+
+     Note: .gitignore prevents accidental staging but does NOT prevent a
+     deliberate commit of these files. A push ruleset enforces this at the
+     repository boundary and applies even to forks, making it a genuine
+     security control rather than a developer convenience.
+
+     Why for IaC:
+     A tfstate file committed to a public or internal GitHub repository
+     exposes your entire AWS resource inventory, ARNs, account IDs, and
+     any sensitive Terraform outputs in plaintext. This is one of the most
+     common causes of infrastructure credential exposure. A push ruleset
+     makes it physically impossible to commit state files, even intentionally.
+
+
+3.3  RESTRICT FILE SIZE                                            [MEDIUM]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     Prevent commits that exceed a specified file size limit from being
+     pushed to the repository. Recommended limit for a Terraform repo:
+     5 MB per file.
+
+     Why for IaC:
+     Terraform modules should consist entirely of small .tf text files.
+     A file exceeding several megabytes in a Terraform repo is almost
+     certainly either a mistakenly committed binary artifact, a data file
+     that should be in S3, or an accidentally included state/plan file.
+     A size limit catches these before they bloat the repository history,
+     which is difficult to clean without rewriting git history.
+
+
+3.4  RESTRICT FILE PATH LENGTH                                     [LOW]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     Prevent commits that include file paths exceeding a specified character
+     limit. Recommended limit: 200 characters.
+
+     Why for IaC:
+     Very long file paths in a Terraform repository are unusual and may
+     indicate a tooling or automation error generating unexpected file
+     structures. Enforcing a reasonable path length limit also prevents
+     issues on Windows-based developer machines where path limits can
+     cause checkout failures.
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 4: CODE SCANNING INTEGRATION (GITHUB ENTERPRISE)
+────────────────────────────────────────────────────────────────────────────────
+
+4.1  REQUIRE CODE SCANNING RESULTS                                 [HIGH]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     If repositories are configured with GitHub Advanced Security code
+     scanning, rulesets can prevent PRs from merging when:
+
+       - A required scanning tool finds a code scanning alert at or above
+         a configured severity threshold
+       - The required tool's analysis is still in progress
+       - The required tool is not configured for the repository at all
+
+     For a Terraform repo, this integrates with tools such as tfsec and
+     Checkov when they are configured as GitHub code scanning integrations
+     (submitting results as SARIF to the code scanning API) rather than
+     as plain status checks.
+
+     Why for IaC:
+     Code scanning integration as a ruleset rule is more robust than a
+     plain status check because it is aware of the severity of findings.
+     You can block merges on CRITICAL and HIGH severity findings while
+     allowing LOW severity findings to pass. A plain status check is binary
+     — pass or fail — with no severity awareness.
+
+
+4.2  REQUIRE CODE QUALITY RESULTS                                  [MEDIUM]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     If repositories are configured with GitHub Code Quality, rulesets can
+     prevent PRs from merging when:
+
+       - Code quality analysis is still in progress
+       - Analysis fails for any reason (including exhausted Actions minutes)
+       - A code quality result meets or exceeds a configured severity threshold
+
+     Why for IaC:
+     Enforces that quality gates cannot be skipped by timing out or by
+     depleting Actions budget. The rule blocks the merge regardless of the
+     reason the analysis did not complete successfully.
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 5: VISIBILITY AND AUDITABILITY
+────────────────────────────────────────────────────────────────────────────────
+
+5.1  LEVERAGE READ-ACCESS VISIBILITY FOR SELF-SERVICE DEBUGGING   [HIGH]
+     Source: about-rulesets
+     ─────────────────────────────────
+     Unlike branch protection rules (visible only to admins), rulesets are
+     visible to anyone with read access. Every developer can navigate to
+     the repository's Rules tab and see exactly which rulesets are active,
+     what rules they contain, and which specific rule is blocking their PR.
+
+     Why for IaC:
+     In a Terraform repo with strict gates, developers frequently hit
+     status check or review requirements they do not understand. With
+     branch protection rules, they must page an admin to explain why the
+     merge button is greyed out. With rulesets, developers can self-diagnose
+     and resolve the issue independently, reducing operational overhead on
+     the platform engineering team.
+
+
+5.2  USE NAMED RULESETS TO COMMUNICATE OWNERSHIP AND PURPOSE      [MEDIUM]
+     Source: about-rulesets
+     ─────────────────────────────────
+     Because rulesets are named and visible to all, the name itself becomes
+     documentation. Use descriptive names that convey who owns the rule and
+     what it protects.
+
+     Recommended naming convention for a Terraform repo:
+       security-team:iam-module-protection
+       devops:main-branch-ci-gates
+       devops:prevent-state-file-commits
+       compliance:signed-commits-required
+       networking-team:network-module-review
+
+     Why for IaC:
+     When a developer's push is blocked and they inspect the ruleset, a
+     clearly named ruleset tells them immediately who to contact and why
+     the rule exists. An ambiguous name like "rule-1" provides no context.
+
+
+5.3  USE ORGANISATION-WIDE RULESETS FOR CONSISTENT POLICY         [HIGH]
+     Source: about-rulesets (GitHub Team and Enterprise)
+     ─────────────────────────────────
+     For organisations on GitHub Team or Enterprise, create organisation-
+     level rulesets that target all Terraform repositories. A single
+     organisation ruleset can enforce baseline rules — block force pushes,
+     require signed commits, block .tfstate and .pem extensions — across
+     every Terraform repo in the organisation simultaneously.
+
+     Repository-level rulesets then layer on top for repo-specific rules
+     (e.g., additional required reviewers for the production Terraform repo
+     vs. a development Terraform repo).
+
+     Why for IaC:
+     Without org-wide rulesets, a new Terraform repository starts with no
+     protections. An engineer can push directly to main with no review, no
+     CI, and no signed commits until someone manually configures protection.
+     An org-wide ruleset applies baseline security controls to the new repo
+     from the moment it is created, with no per-repo configuration needed.
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 6: OIDC AND GITHUB ACTIONS PIPELINE INTEGRATION
+────────────────────────────────────────────────────────────────────────────────
+
+6.1  GRANT BYPASS TO GITHUB-ACTIONS APP, NOT TO HUMAN ROLES       [CRITICAL]
+     Source: about-rulesets, available-rules-for-rulesets
+     ─────────────────────────────────
+     When configuring bypass permissions for a branch ruleset on main,
+     grant bypass only to the github-actions GitHub App — not to the
+     repository administrator role. This means the automated pipeline can
+     merge approved PRs, but individual admins cannot merge their own
+     changes without going through the full review process.
+
+     For push rulesets: the same bypass logic applies across the entire
+     fork network. Only users with bypass in the root repository can bypass
+     push rules in any fork.
+
+     Why for IaC:
+     This is the single most important advantage of rulesets over branch
+     protection rules for an OIDC-based deployment pipeline. Branch
+     protection rules cannot easily separate "let the CI bot bypass" from
+     "let admins bypass." Rulesets make this granular: the github-actions
+     app gets bypass, human admins do not.
+
+
+6.2  LOCK REQUIRED STATUS CHECKS TO GITHUB-ACTIONS APP            [CRITICAL]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     When adding required status checks in a ruleset, select the github-
+     actions app as the expected source for each check. The app must be
+     installed in the repository with the statuses:write permission, must
+     have recently submitted a check run, and must be associated with a
+     pre-existing required status check in the ruleset.
+
+     If the status is set by any other person or integration, merging is
+     blocked. This means a developer cannot manually call the GitHub Statuses
+     API to mark terraform-plan:success — only the automated workflow can.
+
+     Why for OIDC:
+     A supply-chain attack where an attacker gains a developer's credentials
+     could allow them to manually set passing statuses on a PR with
+     malicious Terraform code, bypassing all CI gates. App-locking closes
+     this attack vector entirely.
+
+
+6.3  PROTECT WORKFLOW FILES VIA PUSH RULESET FILE PATH RESTRICTION [CRITICAL]
+     Source: available-rules-for-rulesets
+     ─────────────────────────────────
+     Add a push ruleset that restricts changes to .github/workflows/** and
+     grants bypass only to the devops-leads team. This means no engineer
+     can modify a GitHub Actions workflow without an explicit bypass-
+     permitted team member approving the change at the push level — before
+     the PR is even opened.
+
+     Why for OIDC:
+     GitHub Actions workflows define the OIDC trust relationship and the
+     AWS permissions that the pipeline uses. A tampered workflow could
+     change the OIDC subject claim, switch to a more permissive AWS role,
+     or exfiltrate the OIDC token to an external endpoint. Protecting
+     workflow files at the push level is the most robust defence available.
+
+
+────────────────────────────────────────────────────────────────────────────────
+SUMMARY: PRIORITY MATRIX
+────────────────────────────────────────────────────────────────────────────────
+
+CRITICAL — implement before going live:
+  1.1  Use enforcement statuses — create new rules as Disabled first
+  1.2  Configure fine-grained bypass: github-actions app, not human roles
+  2.2  Restrict updates (no direct pushes to main)
+  2.3  Restrict deletions (protect main and version tags)
+  2.4  Require PR before merging with full sub-settings enabled:
+         - 2 approvals required
+         - Dismiss stale reviews on new commits
+         - Require code owner review
+         - Require approval from someone other than last pusher
+         - Require conversation resolution
+         - Require squash or rebase merge type
+  2.6  Require strict status checks locked to github-actions app
+  2.10 Block force pushes
+  3.1  Push ruleset: restrict .github/workflows/** (devops-leads bypass)
+  3.2  Push ruleset: restrict .tfstate, .tfstate.backup, .pem, .key file
+         extensions
+  6.1  Bypass only github-actions app on branch ruleset, not admin role
+  6.2  Lock required status checks to github-actions app
+  6.3  Protect workflow files via push ruleset path restriction
+
+HIGH — implement as soon as possible:
+  1.3  Understand and rely on rule layering (most restrictive wins)
+  1.4  Target branches and tags with specific fnmatch patterns
+  2.1  Restrict creations on release branches and version tags
+  2.5  Configure required reviewers per file pattern (team-to-path mapping)
+  2.7  Require linear history
+  2.8  Require signed commits
+  4.1  Require code scanning results (GitHub Advanced Security)
+  5.1  Leverage read-access visibility for developer self-service
+  5.3  Use org-wide rulesets for baseline policy across all Terraform repos
+
+MEDIUM — implement for mature and compliance-driven setups:
+  2.9  Require deployments to succeed (staging gate before main merge)
+  3.3  Push ruleset: restrict file size (recommended 5 MB limit)
+  4.2  Require code quality results
+  5.2  Use descriptive ruleset names to communicate ownership and purpose
+
+LOW — implement for completeness:
+  3.4  Push ruleset: restrict file path length (recommended 200 chars)
+
+
+────────────────────────────────────────────────────────────────────────────────
+ADDITIONAL NOTES
+────────────────────────────────────────────────────────────────────────────────
+
+CO-EXISTENCE WITH BRANCH PROTECTION RULES:
+  Rulesets and branch protection rules can be active simultaneously on the
+  same branch. They do not conflict — they aggregate. If you have existing
+  branch protection rules you do not need to delete them to start using
+  rulesets. Add rulesets incrementally (especially push rulesets for file
+  extension restrictions, which have no branch protection equivalent).
+
+REPOSITORY LIMIT:
+  Up to 75 rulesets per repository and 75 organisation-wide rulesets. For
+  a single Terraform repo this limit is unlikely to be reached. For org-wide
+  rulesets targeting many repos, plan the ruleset structure carefully to
+  stay within the limit.
+
+REQUIRED REVIEWER TEAMS:
+  The required reviewer teams specified within a PR rule must belong to the
+  organisation that owns the repository. This rule is not available on user-
+  owned (personal) repositories as they do not contain teams.
+
+SIGNED COMMITS BEHAVIOUR DIFFERENCE FROM BRANCH PROTECTION RULES:
+  With rulesets, when creating a new branch, only commits not accessible
+  from other branches are checked for signatures. With branch protection
+  rules, signed commit checks at branch creation time require the "restrict
+  pushes that create matching branches" setting to be active. When updating
+  an existing branch, both systems check all commits in the specified range.
+
+PUSH RULESET FORK NETWORK COVERAGE:
+  Push rulesets are the only mechanism that protects the entire fork network.
+  Branch protection rules and branch/tag rulesets do not extend to forks.
+  If your Terraform repo is forked (e.g., for environment-specific overrides),
+  push rulesets ensure that .tfstate files and credential files cannot be
+  committed to any fork, not just the upstream repository.
+
+================================================================================
+EOF
+================================================================================
